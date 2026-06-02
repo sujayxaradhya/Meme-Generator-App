@@ -1,0 +1,24 @@
+# Rebuilds + republishes this static site when BetterCMS content is published
+# (repository_dispatch: bcms-rebuild) and on push to main.
+name: BetterCMS Rebuild
+
+on:
+  repository_dispatch:
+    types: [bcms-rebuild]
+  push:
+    branches: [main]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: flowtrix-hub/bettercms-backend/action@main
+        with:
+          api-url: https://api.bettercms.ai
+          api-key: ${{ secrets.BCMS_API_KEY }}
+          project-id: ${{ vars.BCMS_PROJECT_ID }}
+          workspace: ${{ vars.BCMS_WORKSPACE_SLUG }}
+          environment: production
+          # repository_dispatch carries the SHA to rebuild; a push uses its own commit.
+          sha: ${{ github.event.client_payload.sha || github.sha }}
+          build-dir: dist
