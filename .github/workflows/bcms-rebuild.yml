@@ -12,13 +12,60 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: flowtrix-hub/bettercms-backend/action@main
+      - name: Checkout (build the dispatched SHA)
+        uses: actions/checkout@v4
         with:
-          api-url: https://api.bettercms.ai
-          api-key: ${{ secrets.BCMS_API_KEY }}
-          project-id: ${{ vars.BCMS_PROJECT_ID }}
-          workspace: ${{ vars.BCMS_WORKSPACE_SLUG }}
-          environment: production
           # repository_dispatch carries the SHA to rebuild; a push uses its own commit.
-          sha: ${{ github.event.client_payload.sha || github.sha }}
-          build-dir: dist
+          ref: ${{ github.event.client_payload.sha || github.sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Fetch CMS content (build-time injection)
+        env:
+          API_URL: https://api.bettercms.ai
+          API_KEY: ${{ secrets.BCMS_API_KEY }}
+          WORKSPACE: ${{ vars.BCMS_WORKSPACE_SLUG }}
+          ENVIRONMENT: production
+          CONTENT_OUT: bcms-content.json
+        run: |
+          curl -fsSL "$API_URL/action/fetch-content.mjs" -o "$RUNNER_TEMP/fetch-content.mjs"
+          node "$RUNNER_TEMP/fetch-content.mjs"
+
+      - name: Install & build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package, checksum & upload artifact
+        env:
+          API_URL: https://api.bettercms.ai
+          API_KEY: ${{ secrets.BCMS_API_KEY }}
+          PROJECT_ID: ${{ vars.BCMS_PROJECT_ID }}
+          SHA: ${{ github.event.client_payload.sha || github.sha }}
+          BUILD_DIR: dist
+        run: |
+          set -euo pipefail
+          if [ ! -d "$BUILD_DIR" ]; then
+            echo "::error::build-dir '$BUILD_DIR' not found after build"; exit 1
+          fi
+          TARBALL="$RUNNER_TEMP/bcms-artifact.tgz"
+          tar -czf "$TARBALL" -C "$BUILD_DIR" .
+          CHECKSUM="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
+          SIZE="$(stat -c%s "$TARBALL")"
+          echo "artifact: $SIZE bytes, sha256:$CHECKSUM"
+          STATUS="$(curl -sS -o "$RUNNER_TEMP/ingest-resp.json" -w '%{http_code}' \
+            -X POST "$API_URL/api/v1/projects/$PROJECT_ID/artifacts" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "X-Artifact-Sha: $SHA" \
+            -H "X-Artifact-Checksum: sha256:$CHECKSUM" \
+            -H "Content-Type: application/gzip" \
+            -H "Content-Length: $SIZE" \
+            --data-binary @"$TARBALL")"
+          echo "ingest HTTP $STATUS:"; cat "$RUNNER_TEMP/ingest-resp.json"; echo
+          if [ "$STATUS" != "202" ]; then
+            echo "::error::artifact ingest failed (HTTP $STATUS)"; exit 1
+          fi
